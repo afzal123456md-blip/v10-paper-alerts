@@ -1,4 +1,4 @@
-"""v10 paper-trading alerts -> Telegram. Runs every 15 minutes on GitHub Actions (free).
+"""v11 paper-trading alerts -> Telegram. Runs every 15 minutes on GitHub Actions (free).
 Each run: update the candle store (Binance public archive once, then the latest CoinDCX candles),
 replay the exact v10 rules on 15 streams, and send a Telegram message for every NEW paper entry or exit.
 Secrets (set in GitHub > Settings > Secrets and variables > Actions): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID."""
@@ -10,16 +10,18 @@ import pandas as pd
 PAPER_START = "2026-10-27"          # IST date your paper test started
 START_CAPITAL_INR = 34733.63
 USDT_INR = 95.175
-RISK_PER_TRADE = 0.0015             # 0.15% per trade
-MAX_TOTAL_RISK = 0.015              # 1.5% max open risk (paper account)
+MAX_OPEN = 6                        # at most 6 paper trades open at once
+TOTAL_RISK = 0.01                   # 1% of the account at risk in total -> 1% / 6 = 0.167% per trade
+RISK_PER_TRADE = TOTAL_RISK / MAX_OPEN
 COST_ROUND_TRIP = 0.0014
 FUNDING_PER_8H = 0.0001
 DAILY_SUMMARY_IST_HOUR = 9          # morning summary around 09:00 IST
 COINS_1H = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "LTC", "DOT", "TRX"]
 COINS_15M = ["BTC", "ETH", "SOL"]
 PRESETS = {
-    "1H":  dict(tf="1h",  coins=COINS_1H,  breakout=10, ema=100, adx_min=0,  stop_atr=6.0, target_r=4.0, max_bars=480),
-    "15M": dict(tf="15m", coins=COINS_15M, breakout=80, ema=100, adx_min=20, stop_atr=8.0, target_r=4.0, max_bars=768),
+    # target = next support/resistance (lowest low / highest high of the last 50 candles); skip if < 1R away; cap 4R
+    "1H":  dict(tf="1h",  coins=COINS_1H,  breakout=10, ema=100, adx_min=0,  stop_atr=6.0, target_r=4.0, max_bars=480, struct=50, min_r=1.0),
+    "15M": dict(tf="15m", coins=COINS_15M, breakout=80, ema=100, adx_min=20, stop_atr=8.0, target_r=4.0, max_bars=768, struct=50, min_r=1.0),
 }
 KEEP_DAYS = {"15m": 45, "1h": 120, "4h": 240}      # history downloaded when the store is first built
 MAX_KEEP_DAYS = 730                                # the store keeps growing (stable replay), trimmed after 2 years
@@ -120,6 +122,14 @@ def run_stream(coin, chart, htf, p):
     o, h, l, c, t = (chart[k].values for k in ("open", "high", "low", "close", "open_time_ms"))
     n = len(c); a = atr(h, l, c); d = trend_direction(chart, htf, p["tf"], p["ema"], p["adx_min"])
     hi = pd.Series(h).rolling(p["breakout"]).max().values; lo = pd.Series(l).rolling(p["breakout"]).min().values
+    HH = pd.Series(h).rolling(p["struct"]).max().values; LL = pd.Series(l).rolling(p["struct"]).min().values
+    def struct_target(k, s, lvl, risk):
+        """Next support (short) / resistance (long) beyond the breakout; None = too close (skip the trade)."""
+        st = LL[k] if s == -1 else HH[k]
+        dist = s * (st - lvl) / risk if not np.isnan(st) else np.nan
+        if np.isnan(dist) or dist <= 0.05: return lvl + s * p["target_r"] * risk      # open field: cap at 4R
+        if dist < p["min_r"]: return None
+        return lvl + s * min(dist, p["target_r"]) * risk
     trades = []; i = 300; pending = None
     while i < n - 1:
         s = d[i]
@@ -129,7 +139,9 @@ def run_stream(coin, chart, htf, p):
         if not triggered or not (0.0015 <= risk / lvl <= 0.15): i += 1; continue
         entry = max(lvl, o[e_]) if s == 1 else min(lvl, o[e_])
         if s * (entry - sl) <= 0: i += 1; continue
-        tp = lvl + s * p["target_r"] * risk; ex = None; why = "OPEN"
+        tp = struct_target(i, s, lvl, risk)
+        if tp is None: i += 1; continue
+        ex = None; why = "OPEN"
         for j in range(e_, min(n - 1, e_ + p["max_bars"]) + 1):
             if j > e_ and s * (o[j] - sl) <= 0: ex, why = o[j], "stop"; break
             if (s == 1 and l[j] <= sl) or (s == -1 and h[j] >= sl): ex, why = sl, "stop"; break
@@ -145,22 +157,25 @@ def run_stream(coin, chart, htf, p):
     if not trades or trades[-1]["status"] != "OPEN":
         k = n - 1; s = d[k]
         if s != 0 and not np.isnan(hi[k]):
-            lvl = hi[k] if s == 1 else lo[k]; risk = p["stop_atr"] * a[k]
-            pending = dict(coin=coin, chart=p["tf"].upper(), order="BUY STOP" if s == 1 else "SELL STOP", trigger=float(lvl),
-                           stop=float(lvl - s * risk), target=float(lvl + s * p["target_r"] * risk))
+            lvl = hi[k] if s == 1 else lo[k]; risk = p["stop_atr"] * a[k]; tpk = struct_target(k, s, lvl, risk)
+            if tpk is not None and 0.0015 <= risk / lvl <= 0.15:
+                pending = dict(coin=coin, chart=p["tf"].upper(), order="BUY STOP" if s == 1 else "SELL STOP", trigger=float(lvl),
+                               stop=float(lvl - s * risk), target=float(tpk))
     return trades, pending
 
 
 def paper_account(trades, start_ms):
-    """Fake-money balance since PAPER_START with 0.15% risk per trade and the 1.5% cap."""
+    """Fake-money balance since PAPER_START: 1% total risk split over at most MAX_OPEN trades (0.167% each)."""
     T = sorted([x for x in trades if x["entry_ms"] >= start_ms], key=lambda x: x["entry_ms"])
     realised, book, rows = [], [], []
     for x in T:
         eq_now = START_CAPITAL_INR + sum(p for ex, p in realised if ex <= x["entry_ms"])
         book = [b for b in book if b["status"] == "OPEN" or b["exit_ms"] > x["entry_ms"]]
-        if sum(b["risk_inr"] for b in book) + eq_now * RISK_PER_TRADE > eq_now * MAX_TOTAL_RISK + 1e-9:
+        if len(book) >= MAX_OPEN:
             rows.append(dict(x, taken=False, risk_inr=0.0, pnl_inr=0.0)); continue
-        y = dict(x, taken=True, risk_inr=eq_now * RISK_PER_TRADE); y["pnl_inr"] = y["R"] * y["risk_inr"]
+        # size so that a stop-out INCLUDING fees costs about 1R (the stop distance plus the round-trip fee = the risk budget)
+        frac = abs(x["entry"] - x["stop"]) / (abs(x["entry"] - x["stop"]) + COST_ROUND_TRIP * x["entry"])
+        y = dict(x, taken=True, risk_inr=eq_now * RISK_PER_TRADE, frac=frac); y["pnl_inr"] = y["R"] * y["risk_inr"] * frac
         if y["status"] != "OPEN": realised.append((y["exit_ms"], y["pnl_inr"]))
         book.append(y); rows.append(y)
     return START_CAPITAL_INR + sum(p for _, p in realised), rows
@@ -204,29 +219,35 @@ def main():
     by_key = {r["key"]: r for r in rows}
     latest = max((int(d.open_time_ms.iloc[-1]) + MS[tf] for (c, tf), d in data.items() if len(d)), default=NOW_MS)
 
-    if state is None:   # first run: set the baseline, no historical spam
-        opn = [x for x in trades if x["status"] == "OPEN"]
-        msg = [f"v10 paper alerts are ON. Checking every 15 min.", f"Paper balance: Rs {bal:,.0f} (start Rs {START_CAPITAL_INR:,.0f}, from {PAPER_START})",
-               f"Open paper positions now: {len(opn)}"]
+    if state is None or state.get("version") != "v11":   # first run (or upgrade from v10): set the baseline, no historical spam
+        opn = [r for r in rows if r["taken"] and r["status"] == "OPEN"]
+        msg = [f"v11 paper alerts are ON: max {MAX_OPEN} trades open, {TOTAL_RISK:.0%} total risk (Rs {START_CAPITAL_INR * RISK_PER_TRADE:,.0f} per trade), "
+               f"targets at the next support/resistance (1R to 4R). Checking every 15 min.",
+               f"Paper balance: Rs {bal:,.0f} (start Rs {START_CAPITAL_INR:,.0f}, from {PAPER_START})", f"Open paper positions now: {len(opn)}/{MAX_OPEN}"]
         msg += [f"  {x['coin']} {x['chart']} {x['side']} @ {fp(x['entry'])} | SL {fp(x['stop'])} | TP {fp(x['target'])}" for x in opn]
         send("\n".join(msg))
-        state = dict(seen_entries=[x["key"] for x in trades], seen_exits=[x["key"] for x in trades if x["status"] != "OPEN"],
-                     last_summary_day="")
+        state = dict(state or {}, version="v11", seen_entries=[x["key"] for x in trades],
+                     seen_exits=[x["key"] for x in trades if x["status"] != "OPEN"], last_summary_day=(state or {}).get("last_summary_day", ""))
     else:
         seen_e, seen_x = set(state["seen_entries"]), set(state["seen_exits"])
         guard = state.get("latest_ms", 0) - 2 * MS["1h"]      # only events newer than the previous run are alerted
         for x in sorted(trades, key=lambda z: z["entry_ms"]):
             if x["key"] not in seen_e and x["entry_ms"] < guard: seen_e.add(x["key"])
             if x["status"] != "OPEN" and x["key"] not in seen_x and x["exit_ms"] < guard: seen_x.add(x["key"])
-            r = by_key.get(x["key"]); note = "" if r is None else ("" if r["taken"] else "  (skipped in paper account: 1.5% risk cap)")
+            r = by_key.get(x["key"]); note = ""
+            if r is not None and not r["taken"]:      # skipped because 6 trades were already open: no Telegram noise
+                if x["key"] not in seen_e: print(f"skipped (already {MAX_OPEN} open): {x['key']}")
+                seen_e.add(x["key"]); seen_x.add(x["key"]); continue
             if x["key"] not in seen_e:
-                size = "" if r is None or not r["taken"] else f"\nPaper risk Rs {r['risk_inr']:,.0f} | size {r['risk_inr'] / USDT_INR / abs(x['entry'] - x['stop']):.4g} {x['coin']}"
-                send(f"v10 PAPER ENTRY: {x['coin']} {x['chart']} {x['side']}\nEntry {fp(x['entry'])} ({x['chart']} candle from {ist(x['entry_ms'])} IST)\n"
-                     f"Stop {fp(x['stop'])} | Target {fp(x['target'])}{size}{note}")
+                size = "" if r is None or not r["taken"] else f"\nPaper risk Rs {r['risk_inr']:,.0f} | size {r['risk_inr'] * r['frac'] / USDT_INR / abs(x['entry'] - x['stop']):.4g} {x['coin']}"
+                n_open = sum(1 for z in rows if z["taken"] and z["status"] == "OPEN")
+                tr_ = abs(x['target'] - x['entry']) / abs(x['entry'] - x['stop'])
+                send(f"v11 PAPER ENTRY: {x['coin']} {x['chart']} {x['side']}\nEntry {fp(x['entry'])} ({x['chart']} candle from {ist(x['entry_ms'])} IST)\n"
+                     f"Stop {fp(x['stop'])} | Target {fp(x['target'])} (about {tr_:.1f}R, next structure){size}\nOpen paper trades: {n_open}/{MAX_OPEN}")
                 seen_e.add(x["key"])
             if x["status"] != "OPEN" and x["key"] not in seen_x:
                 pnl = "" if r is None or not r["taken"] else f" | Rs {r['pnl_inr']:+,.0f}"
-                send(f"v10 PAPER EXIT: {x['coin']} {x['chart']} {x['side']} ({x['status']})\nExit {fp(x['exit'])} ({ist(x['exit_ms'])} IST) | "
+                send(f"v11 PAPER EXIT: {x['coin']} {x['chart']} {x['side']} ({x['status']})\nExit {fp(x['exit'])} ({ist(x['exit_ms'])} IST) | "
                      f"{x['R']:+.2f}R{pnl}\nPaper balance: Rs {bal:,.0f} ({bal / START_CAPITAL_INR - 1:+.2%}){note}")
                 seen_x.add(x["key"])
         state["seen_entries"], state["seen_exits"] = sorted(seen_e), sorted(seen_x)
@@ -235,7 +256,7 @@ def main():
     if now_ist.hour == DAILY_SUMMARY_IST_HOUR and state.get("last_summary_day") != now_ist.strftime("%Y-%m-%d"):
         closed = [r for r in rows if r["taken"] and r["status"] != "OPEN"]; opn = [r for r in rows if r["taken"] and r["status"] == "OPEN"]
         w = sum(r["pnl_inr"] > 0 for r in closed)
-        msg = [f"v10 DAILY PAPER SUMMARY ({now_ist:%d %b})", f"Balance Rs {bal:,.0f} ({bal / START_CAPITAL_INR - 1:+.2%}) since {PAPER_START}",
+        msg = [f"v11 DAILY PAPER SUMMARY ({now_ist:%d %b})", f"Balance Rs {bal:,.0f} ({bal / START_CAPITAL_INR - 1:+.2%}) since {PAPER_START}",
                f"Closed trades {len(closed)} (wins {w}, losses {len(closed) - w}) | open {len(opn)} (unrealised Rs {sum(r['pnl_inr'] for r in opn):+,.0f})"]
         if pend:
             msg.append("Resting orders now:")
@@ -244,12 +265,12 @@ def main():
 
     if log:
         print("Data notes:\n  " + "\n  ".join(log))
-        if len(log) >= 10: send("v10 alerts: data download problems this run:\n" + "\n".join(log[:10]))
+        if len(log) >= 10: send("v11 alerts: data download problems this run:\n" + "\n".join(log[:10]))
     state["latest_ms"] = int(latest); state["last_run_ist"] = now_ist.strftime("%Y-%m-%d %H:%M"); state["latest_candle_ist"] = ist(latest)
     json.dump(state, open(state_path, "w"))
     print(f"Run OK at {now_ist:%d %b %H:%M} IST | {len(trades)} trades in history | paper balance Rs {bal:,.0f}")
 
 
 if __name__ == "__main__":
-    if "--test" in sys.argv: send("v10 alerts test message: Telegram is connected."); sys.exit(0)
+    if "--test" in sys.argv: send("v11 alerts test message: Telegram is connected."); sys.exit(0)
     main()
