@@ -16,6 +16,12 @@ RISK_PER_TRADE = TOTAL_RISK / MAX_OPEN
 COST_ROUND_TRIP = 0.0014
 FUNDING_PER_8H = 0.0001
 DAILY_SUMMARY_IST_HOUR = 9          # morning summary around 09:00 IST
+# ---- manual-trading scan (published hourly to scan/latest.json, Telegram summary once a day) ----
+ALIVE_HOURS = 6                     # "bot alive" Telegram message every 6 hours
+SCAN_HOUR_IST = 10                  # Telegram "manual setup scan" at the first run after 10:00 IST
+SCAN_RISK_INR = 150                 # risk per manual trade (v2.0 cap); 2 trades = Rs 300 = 0.86% of capital
+SCAN_LEVERAGE = 5
+EXTRA_1H = ["NEAR", "APT", "ARB", "OP", "SUI", "INJ", "FIL", "ATOM", "BCH", "ETC"]   # price/ATR for funding-squeeze checks
 COINS_1H = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "LTC", "DOT", "TRX"]
 COINS_15M = ["BTC", "ETH", "SOL"]
 PRESETS = {
@@ -198,10 +204,75 @@ def fp(x): return f"{x:,.2f}" if abs(x) >= 100 else f"{x:.5g}"
 def ist(ms): return (pd.Timestamp(ms, unit="ms") + IST).strftime("%d %b %H:%M")
 
 
+# ------------------------------ manual-trading scan ------------------------------
+def scan_publish(data, trades, pend, rows, state, now_ist):
+    """Rank the resting v11 orders for manual execution and publish them (scan/latest.json, hourly)."""
+    open_now = {(x["coin"], x["chart"]) for x in trades if x["status"] == "OPEN"}
+    coins = {}
+    for (c, tf), d in data.items():
+        if tf != "1h" or len(d) < 60: continue
+        h, l, cl = d.high.values, d.low.values, d.close.values; a = atr(h, l, cl)
+        info = dict(price=float(cl[-1]), atr_1h=float(a[-1]), atr_1h_pct=float(a[-1] / cl[-1] * 100),
+                    chg_24h_pct=float((cl[-1] / cl[-25] - 1) * 100) if len(cl) > 25 else None)
+        h4 = data.get((c, "4h"))
+        if h4 is not None and len(h4) > 120:
+            c4 = h4.close.values; e4 = ema(c4, 100); a4 = adx(h4.high.values, h4.low.values, c4)
+            info.update(trend_4h="UP" if c4[-1] > e4[-1] else "DOWN", ema100_4h=float(e4[-1]), adx_4h=float(a4[-1]))
+        coins[c] = info
+    cands = []
+    for p_ in pend:
+        c = p_["coin"]; side = 1 if p_["order"] == "BUY STOP" else -1
+        tfk = p_["chart"].lower(); d = data.get((c, tfk))
+        if d is None or c not in coins: continue
+        price = float(d.close.values[-1]); trig, sl, tp = p_["trigger"], p_["stop"], p_["target"]
+        dist = side * (trig - price)                       # > 0: price still has to travel to the trigger
+        if dist <= 0: continue                             # already through the level: do not chase
+        risk_px = abs(trig - sl); rr = abs(tp - trig) / risk_px
+        a1 = coins[c]["atr_1h"]; dist_atr = dist / a1
+        qty = SCAN_RISK_INR / USDT_INR / risk_px; notional = qty * trig
+        close_s = 40 * (1 - min(dist_atr, 4) / 4); rew_s = 30 * min(rr, 4) / 4; adx_s = 30 * min(coins[c].get("adx_4h", 0), 40) / 40
+        cands.append(dict(coin=c, chart=p_["chart"], side="LONG" if side == 1 else "SHORT", order=p_["order"],
+                          price=price, trigger=trig, stop=sl, target=tp, rr=round(rr, 2),
+                          dist_pct=round(dist / price * 100, 3), dist_atr_1h=round(dist_atr, 2), stop_pct=round(risk_px / trig * 100, 2),
+                          qty=qty, notional_usdt=round(notional, 2), margin_usdt_5x=round(notional / SCAN_LEVERAGE, 2),
+                          risk_inr=SCAN_RISK_INR, reward_inr=round(SCAN_RISK_INR * rr, 0),
+                          score=round(close_s + rew_s + adx_s), in_paper_trade=(c, p_["chart"]) in open_now))
+    cands.sort(key=lambda z: -z["score"])
+    hour_key = now_ist.strftime("%Y-%m-%d %H")
+    out = dict(generated_ist=now_ist.strftime("%Y-%m-%d %H:%M"), hour_key=hour_key, usdt_inr=USDT_INR,
+               rules="v11: stop order at trigger (1H: 10-candle high/low, 15M: 80-candle), 4H EMA100 trend, stop 6xATR(1H) / 8xATR(15M), "
+                     "target = next 50-candle structure (1-4R), time-stop 20 days (1H) / 8 days (15M). Funding squeeze: buy when Binance "
+                     "funding <= -0.05%, stop 4xATR(1H), exit after 72h.",
+               candidates=cands, coins=coins,
+               paper_open=[dict(coin=x["coin"], chart=x["chart"], side=x["side"], entry=x["entry"], stop=x["stop"], target=x["target"])
+                           for x in trades if x["status"] == "OPEN"])
+    path = os.path.join("scan", "latest.json"); old_key = None
+    if os.path.exists(path):
+        try: old_key = json.load(open(path)).get("hour_key")
+        except Exception: pass
+    if old_key != hour_key:                                # publish at most once per hour (keeps the repo history small)
+        os.makedirs("scan", exist_ok=True); json.dump(out, open(path, "w"), indent=1)
+    # Telegram: once a day after SCAN_HOUR_IST
+    day = now_ist.strftime("%Y-%m-%d")
+    if now_ist.hour >= SCAN_HOUR_IST and state.get("last_scan_day") != day:
+        top, used = [], set()
+        for z in cands:
+            if z["coin"] in used or z["dist_atr_1h"] > 3: continue
+            top.append(z); used.add(z["coin"])
+            if len(top) == 2: break
+        msg = [f"MANUAL SETUP SCAN {now_ist:%d %b %H:%M} IST (tested v11 rules, Rs {SCAN_RISK_INR} risk each, isolated {SCAN_LEVERAGE}x)"]
+        if not top: msg.append("No setup within 3 ATR of its trigger today. Stay flat.")
+        for k, z in enumerate(top, 1):
+            msg.append(f"{k}) {z['coin']} {z['chart']} {z['side']} | {('STOP-LIMIT BUY' if z['side'] == 'LONG' else 'STOP-LIMIT SELL')} trigger {fp(z['trigger'])} (now {fp(z['price'])}, {z['dist_pct']}% away)\n"
+                       f"   SL {fp(z['stop'])} ({z['stop_pct']}%) | TP {fp(z['target'])} ({z['rr']}R, ~Rs {z['reward_inr']:.0f}) | qty {z['qty']:.4g} | margin ~{z['margin_usdt_5x']} USDT | score {z['score']}")
+        msg.append("Claude adds the news check in the morning briefing. Cancel unfilled orders at the next scan.")
+        send("\n".join(msg)); state["last_scan_day"] = day
+
+
 # ------------------------------ main ------------------------------
 def main():
     log = []; data = {}
-    need = sorted({(c, "4h") for c in set(COINS_1H) | set(COINS_15M)} | {(c, "1h") for c in COINS_1H} | {(c, "15m") for c in COINS_15M})
+    need = sorted({(c, "4h") for c in set(COINS_1H) | set(COINS_15M)} | {(c, "1h") for c in COINS_1H + EXTRA_1H} | {(c, "15m") for c in COINS_15M})
     for coin, tf in need:
         try: data[(coin, tf)] = update_store(coin, tf, log)
         except Exception as e: log.append(f"{coin} {tf}: {e}")
@@ -262,6 +333,20 @@ def main():
             msg.append("Resting orders now:")
             msg += [f"  {p_['coin']} {p_['chart']} {p_['order']} {fp(p_['trigger'])} | SL {fp(p_['stop'])} | TP {fp(p_['target'])}" for p_ in pend]
         send("\n".join(msg)); state["last_summary_day"] = now_ist.strftime("%Y-%m-%d")
+
+    # ---- "bot alive" heartbeat every ALIVE_HOURS ----
+    state["runs_since_alive"] = state.get("runs_since_alive", 0) + 1
+    if NOW_MS - state.get("last_alive_ms", 0) >= ALIVE_HOURS * 3_600_000:
+        in_trade = sum(1 for x in trades if x["status"] == "OPEN")
+        paper_open = sum(1 for r in rows if r["taken"] and r["status"] == "OPEN")
+        send(f"\u2705 Bot alive {now_ist:%d %b %H:%M} IST | {state['runs_since_alive']} runs OK since last check\n"
+             f"Latest candle: {ist(latest)} IST | data problems: {len(log)}\n"
+             f"Streams in a trade: {in_trade}/15 | resting orders: {len(pend)} | paper positions: {paper_open}/{MAX_OPEN}\n"
+             f"Paper balance: Rs {bal:,.0f} ({bal / START_CAPITAL_INR - 1:+.2%})")
+        state["last_alive_ms"] = NOW_MS; state["runs_since_alive"] = 0
+
+    try: scan_publish(data, trades, pend, rows, state, now_ist)
+    except Exception as e: print("scan failed:", e)
 
     if log:
         print("Data notes:\n  " + "\n  ".join(log))
