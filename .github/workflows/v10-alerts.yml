@@ -1,0 +1,50 @@
+name: v10 paper alerts
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"        # every 15 minutes (GitHub may delay runs by a few minutes)
+  workflow_dispatch:              # "Run workflow" button for manual runs
+    inputs:
+      test:
+        description: "Only send a Telegram test message"
+        type: boolean
+        default: false
+
+concurrency:
+  group: v10-alerts
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install pandas numpy
+
+      - name: Restore candle store
+        uses: actions/cache/restore@v4
+        with:
+          path: store
+          key: v10-store-${{ github.run_id }}
+          restore-keys: v10-store-
+
+      - name: Run v10 checker
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ inputs.test }}" = "true" ]; then python v10_alerts.py --test; else python v10_alerts.py; fi
+
+      - name: Save candle store
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: store
+          key: v10-store-${{ github.run_id }}
