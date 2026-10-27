@@ -17,7 +17,7 @@ COST_ROUND_TRIP = 0.0014
 FUNDING_PER_8H = 0.0001
 DAILY_SUMMARY_IST_HOUR = 9          # morning summary around 09:00 IST
 # ---- manual-trading scan (published hourly to scan/latest.json, Telegram summary once a day) ----
-ALIVE_HOURS = 6                     # "bot alive" Telegram message every 6 hours
+ALIVE_HOURS = 1                     # "bot alive" Telegram message every hour (change to 6 for fewer messages)
 SCAN_HOUR_IST = 10                  # Telegram "manual setup scan" at the first run after 10:00 IST
 SCAN_RISK_INR = 150                 # risk per manual trade (v2.0 cap); 2 trades = Rs 300 = 0.86% of capital
 SCAN_LEVERAGE = 5
@@ -336,7 +336,7 @@ def main():
 
     # ---- "bot alive" heartbeat every ALIVE_HOURS ----
     state["runs_since_alive"] = state.get("runs_since_alive", 0) + 1
-    if NOW_MS - state.get("last_alive_ms", 0) >= ALIVE_HOURS * 3_600_000:
+    if NOW_MS - state.get("last_alive_ms", 0) >= ALIVE_HOURS * 3_600_000 - 300_000:
         in_trade = sum(1 for x in trades if x["status"] == "OPEN")
         paper_open = sum(1 for r in rows if r["taken"] and r["status"] == "OPEN")
         send(f"\u2705 Bot alive {now_ist:%d %b %H:%M} IST | {state['runs_since_alive']} runs OK since last check\n"
